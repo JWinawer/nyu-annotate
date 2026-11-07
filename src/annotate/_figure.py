@@ -840,8 +840,12 @@ class FigurePanel(ipw.HBox):
     
     # Key Press Event Handler Methods ------------------------------------------
 
-    def toggle_cursor(self):
-        """Toggles the cursor position of the active annotation."""
+    def toggle_cursor(self, reverse = False):
+        """Toggles the cursor position of the active annotation.
+
+        The cursor moves to the next editable point, or to the previous one if
+        `reverse` is `True` (Shift+Tab).
+        """
         # If the figure is locked, we do not allow events. Skip.
         if self.state.locked: return
 
@@ -861,8 +865,10 @@ class FigurePanel(ipw.HBox):
             # Get the index of the current cursor position in the editable points.
             current_index = np.where(self.editable == self.cursor)[0][0]
 
-            # Calculate the index of the next editable point with wraparound.
-            next_index = np.mod(current_index + 1, self.editable.shape[0])
+            # Calculate the index of the next (or previous) editable point with
+            # wraparound.
+            step = -1 if reverse else 1
+            next_index = np.mod(current_index + step, self.editable.shape[0])
 
             # Update the cursor to the next editable point.
             self.cursor = self.editable[next_index]
@@ -960,8 +966,8 @@ class FigurePanel(ipw.HBox):
         # Handle the key press.
         key = key.lower()
         if key == "tab":
-            # Toggle the cursor (active) position.
-            self.toggle_cursor()
+            # Toggle the cursor (active) position; Shift+Tab goes backward.
+            self.toggle_cursor(reverse = bool(shift_down))
         elif key == "backspace":
             # Delete current cursor (active) point.
             self.pop_point()

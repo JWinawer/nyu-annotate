@@ -83,6 +83,13 @@ class CortexViewerState:
             "line_interp"       : 10,
         }
 
+        # Set cortex viewer view options (camera and drawing)
+        self.view = {
+            "camera_mode"  : "orbit",   # "orbit" (fixed up axis) or "trackball"
+            "height"       : 640,       # height of the 3D panel in pixels
+            "draw_on_mesh" : False,     # whether clicks on the mesh add points
+        }
+
         # Prepare participant 3d coordinate and mesh data
         self.update_participant()
         self.update_coordinates()
@@ -104,14 +111,30 @@ class CortexViewerState:
         fsa = ny.freesurfer_subject("fsaverage")
         
         # Return fsaverage dictionary values
-        return {
-            h: {
-                "tesselation": fsa.hemis[h].tess.faces, 
-                "inflated"   : fsa.hemis[h].surface("inflated").coordinates, 
-                "flatmap"    : fsa.hemis[h].mask_flatmap(
-                    **CortexViewerState.__FLATMAP_KWARGS)
-            } for h in ( "lh", "rh" )
-        }
+        out = {}
+        for h in ( "lh", "rh" ):
+            hemi    = fsa.hemis[h]
+            flatmap = hemi.mask_flatmap(**CortexViewerState.__FLATMAP_KWARGS)
+            out[h]  = {
+                "tesselation" : hemi.tess.faces,
+                "inflated"    : hemi.surface("inflated").coordinates,
+                "flatmap"     : flatmap,
+                # Lookup from surface vertex index to flatmap column (-1 for
+                # vertices that are not in the flatmap). Used to map clicks on
+                # the 3D mesh back to flatmap (figure) coordinates.
+                "flat_index"  : CortexViewerState._make_flat_index(
+                    hemi.vertex_count, flatmap.labels),
+            }
+        return out
+
+
+    @staticmethod
+    def _make_flat_index(n_vertices, flatmap_labels):
+        """Make an array mapping each surface vertex to its flatmap column."""
+        flat_index = np.full(int(n_vertices), -1, dtype = int)
+        flat_index[np.asarray(flatmap_labels, dtype = int)] = \
+            np.arange(len(flatmap_labels))
+        return flat_index
 
     # [Annotation Tool] Get Active Widget Methods ------------------------------
 
@@ -296,6 +319,68 @@ class CortexViewerState:
                 color = prop_color, **prop_kwargs["kwargs"])[:, :3]
 
     # [Cortex Viewer] Update Surface Coordinates -------------------------------
+
+    @staticmethod
+    def _barycentric_weights(point, triangle):
+        """Barycentric weights of a 3D point projected onto a triangle.
+
+        `triangle` is a 3 x 3 matrix whose columns are the triangle corners.
+        The weights are clipped to be non-negative and sum to 1, so a point
+        just outside the triangle (from rounding) maps to its nearest edge.
+        """
+        a, b, c = triangle[:, 0], triangle[:, 1], triangle[:, 2]
+        v0, v1, v2 = b - a, c - a, point - a
+        d00, d01, d11 = v0 @ v0, v0 @ v1, v1 @ v1
+        d20, d21 = v2 @ v0, v2 @ v1
+        denom = d00 * d11 - d01 * d01
+        if not np.isfinite(denom) or abs(denom) < 1e-12:
+            return None # degenerate triangle
+        wb = (d11 * d20 - d01 * d21) / denom
+        wc = (d00 * d21 - d01 * d20) / denom
+        w  = np.clip(np.array([1.0 - wb - wc, wb, wc]), 0, None)
+        return w / w.sum()
+
+
+    def surface_to_flatmap(self, position, face = None):
+        """Convert a point on the 3D mesh into flatmap (figure) coordinates.
+
+        `position` is the clicked 3D point (in the current, possibly inflated,
+        mesh coordinates) and `face` is the three vertex indices of the
+        triangle that was clicked (as reported by k3d). If `face` is missing or
+        does not contain the point, the nearest vertex is used instead.
+
+        Returns a length-2 array, or `None` if the point is outside the region
+        covered by the flatmap.
+        """
+        fsa        = self.fsaverage[self.hemisphere]
+        flat_index = fsa["flat_index"]
+        flat_xy    = np.asarray(fsa["flatmap"].coordinates) # (2, n_flat)
+        coords     = self.coordinates                       # (3, n_vertices)
+        position   = np.asarray(position, dtype = float).reshape(3)
+        n_vertices = coords.shape[1]
+
+        # First try: barycentric interpolation within the clicked triangle.
+        if face is not None:
+            face = np.asarray(face, dtype = int).reshape(-1)
+            if face.shape == (3,) and np.all((face >= 0) & (face < n_vertices)):
+                triangle = coords[:, face]
+                # Accept the triangle only if the click is close to it (a
+                # sanity check that k3d's face indices match our vertices).
+                edge = np.max(np.linalg.norm(
+                    triangle - np.roll(triangle, 1, axis = 1), axis = 0))
+                dist = np.min(np.linalg.norm(triangle - position[:, None], axis = 0))
+                w = self._barycentric_weights(position, triangle)
+                if w is not None and dist <= 2 * edge + 1e-6:
+                    cols = flat_index[face]
+                    if np.any(cols < 0): return None
+                    return flat_xy[:, cols] @ w
+
+        # Fallback: the nearest vertex.
+        vertex = int(np.argmin(np.sum((coords - position[:, None])**2, axis = 0)))
+        col = flat_index[vertex]
+        if col < 0: return None
+        return flat_xy[:, col].copy()
+
 
     @staticmethod
     def _flatmap_to_surface(flatmap_address, mesh_coordinates):
@@ -501,7 +586,7 @@ class CortexViewer(ipw.GridBox):
     def __init__(
             self, annotation_widgets, dataset_directory, 
             control_panel_background_color = "#f0f0f0",
-            panel_width = 270, panel_height = 512
+            panel_width = 270, panel_height = None
         ):
         # Initialize the Cortex Viewer state
         self.state = CortexViewerState(
@@ -548,7 +633,77 @@ class CortexViewer(ipw.GridBox):
 
         # Assign style option observers
         for key in self._style_observers.keys():
-            self._style_observers[key](partial(self.on_style_change, key)) 
+            self._style_observers[key](partial(self.on_style_change, key))
+
+        # Assign view and drawing observers
+        self.control_panel.observe_camera_dropdown(self.on_camera_mode_change)
+        self.control_panel.observe_height_slider(self.on_height_change)
+        self.control_panel.observe_draw_checkbox(self.on_draw_toggle)
+        self.control_panel.reset_button.on_click(
+            lambda _: self.figure_panel.reset_camera())
+        self.control_panel.delete_button.on_click(self.on_delete_point)
+
+        # Clicks on the mesh add points to the active annotation
+        self.figure_panel.mesh_click_handler = self.on_mesh_click
+
+    # [Cortex Viewer] View and Drawing Handlers --------------------------------
+
+    def on_camera_mode_change(self, change):
+        """Handle changes to the camera (rotation) mode."""
+        self.state.view["camera_mode"] = change.new
+        self.figure_panel.set_camera_mode(change.new)
+
+
+    def on_height_change(self, change):
+        """Handle changes to the 3D panel height."""
+        self.state.view["height"] = change.new
+        self.figure_panel.set_height(change.new)
+
+
+    def on_draw_toggle(self, change):
+        """Turn drawing on the mesh on or off."""
+        self.state.view["draw_on_mesh"] = bool(change.new)
+        self.figure_panel.set_draw_mode(bool(change.new))
+
+
+    def _flash_message(self, figure_panel, message, seconds = 2.5):
+        """Show a short message on the flatmap canvas, then clear it."""
+        import threading
+        figure_panel.write_message(message, fontsize = 24)
+        threading.Timer(seconds, figure_panel.clear_message).start()
+
+
+    def on_delete_point(self, _ = None):
+        """Delete the point at the cursor of the active annotation."""
+        figure_panel = self.state._get_active_figure_panel()
+        if figure_panel.state.locked: return
+        figure_panel.pop_point()
+
+
+    def on_mesh_click(self, content):
+        """Add a point to the active annotation where the mesh was clicked.
+
+        The clicked 3D point is converted to flatmap coordinates, and then
+        added with the flatmap tool's own `push_point`, so it behaves exactly
+        like a click on the flatmap (cursor, fixed points, dependencies, and
+        saving all work the same way). The 3D view then updates through the
+        usual annotation-change observer.
+        """
+        figure_panel = self.state._get_active_figure_panel()
+        if figure_panel.state.locked: return
+        if self.state.active is None:
+            self._flash_message(figure_panel,
+                "Select an annotation before drawing on the mesh.")
+            return
+
+        point = self.state.surface_to_flatmap(
+            content.get("position"), content.get("face"))
+        if point is None:
+            self._flash_message(figure_panel,
+                "That spot is outside the flatmap region.")
+            return
+
+        figure_panel.push_point(np.asarray(point, dtype = float))
 
 
     @property

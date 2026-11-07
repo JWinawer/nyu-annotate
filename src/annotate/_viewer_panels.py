@@ -21,6 +21,8 @@ CortexViewer is implmented in _viewer.py.
 
 import k3d
 import html
+import time
+import threading
 import numpy as np
 import ipywidgets as ipw
 from matplotlib.colors import to_rgb
@@ -67,6 +69,15 @@ class CortexControlPanel(ipw.VBox):
         # Create the number of line points slider widget
         self.line_interp_slider = self._init_line_interp_slider()
 
+        # Create the view widgets (camera mode, panel height, reset button)
+        self.camera_dropdown  = self._init_camera_dropdown()
+        self.height_slider    = self._init_height_slider()
+        self.reset_button     = self._init_button("Reset view", "Return the camera to the starting view.")
+
+        # Create the drawing widgets (draw on mesh toggle, delete point button)
+        self.draw_checkbox    = self._init_draw_checkbox()
+        self.delete_button    = self._init_button("Delete point", "Delete the point at the cursor of the active annotation (same as Backspace on the flatmap).")
+
         # Assemble the control panel with children widgets
         children = [
             # Cortex Viewer title
@@ -95,6 +106,24 @@ class CortexControlPanel(ipw.VBox):
             self.line_width_slider,
             # Line interpolation slider
             self.line_interp_slider,
+            # Horizontal line
+            self._make_hline(),
+            # View Options title
+            self._make_section_title("View:"),
+            # Camera mode dropdown
+            self.camera_dropdown,
+            # Panel height slider
+            self.height_slider,
+            # Reset view button
+            self.reset_button,
+            # Horizontal line
+            self._make_hline(),
+            # Drawing Options title
+            self._make_section_title("Draw:"),
+            # Draw on mesh checkbox
+            self.draw_checkbox,
+            # Delete point button
+            self.delete_button,
         ]
         vbox = ipw.VBox(children, layout = { "width": "250px" })
 
@@ -281,7 +310,53 @@ class CortexControlPanel(ipw.VBox):
             orientation       = "horizontal",
         )
         return line_interp_slider
-    
+
+
+    def _init_camera_dropdown(self):
+        camera_dropdown = ipw.Dropdown(
+            options     = [
+                ( "Orbit (steady)", "orbit" ),
+                ( "Trackball (free)", "trackball" ),
+            ],
+            value       = self.state.view["camera_mode"],
+            description = "Rotation:",
+        )
+        camera_dropdown.add_class("cortex-control-widgets")
+        return camera_dropdown
+
+
+    def _init_height_slider(self):
+        height_slider = ipw.IntSlider(
+            value             = self.state.view["height"],
+            min               = 300,
+            max               = 1400,
+            step              = 50,
+            description       = "Height (px):",
+            continuous_update = False,
+            orientation       = "horizontal",
+        )
+        height_slider.add_class("cortex-control-widgets")
+        return height_slider
+
+
+    def _init_draw_checkbox(self):
+        draw_checkbox = ipw.Checkbox(
+            value       = self.state.view["draw_on_mesh"],
+            description = "Click on mesh to add points",
+            indent      = False,
+            tooltip     = "When checked, clicking on the 3D mesh adds a point "
+                          "to the active annotation, just like clicking on "
+                          "the flatmap.",
+        )
+        draw_checkbox.add_class("cortex-control-widgets")
+        return draw_checkbox
+
+
+    def _init_button(self, description, tooltip = ""):
+        button = ipw.Button(description = description, tooltip = tooltip)
+        button.add_class("cortex-control-widgets")
+        return button
+
 
     def refresh_infobox(self, key):
         """Refresh the control panel display to reflect updated infobox values."""
@@ -321,6 +396,21 @@ class CortexControlPanel(ipw.VBox):
         """A method to register a callback for changes in the line points slider."""
         self.line_interp_slider.observe(callback, names = "value")
 
+
+    def observe_camera_dropdown(self, callback):
+        """A method to register a callback for changes in the camera mode."""
+        self.camera_dropdown.observe(callback, names = "value")
+
+
+    def observe_height_slider(self, callback):
+        """A method to register a callback for changes in the panel height."""
+        self.height_slider.observe(callback, names = "value")
+
+
+    def observe_draw_checkbox(self, callback):
+        """A method to register a callback for the draw on mesh checkbox."""
+        self.draw_checkbox.observe(callback, names = "value")
+
 # The Cortex Figure Panel ------------------------------------------------------
 
 class CortexFigurePanel(ipw.GridBox):
@@ -329,21 +419,49 @@ class CortexFigurePanel(ipw.GridBox):
     The panel that contains the 3D cortex plot for the Cortex Viewer tool.
     """
     
-    def __init__(self, state, width = None, height = 512):
+    # Camera field of view (degrees). A narrower field of view with the camera
+    # farther away gives less perspective distortion and steadier rotation
+    # than the original 60 degrees.
+    CAMERA_FOV = 35
+
+    # Starting camera: [position (3), target (3), up vector (3)]. Same viewing
+    # direction as the original [-160, -10, -6, 15, -30, 0, 0, 0, 1], with the
+    # camera moved back so the brain fills a similar part of the panel at the
+    # narrower field of view.
+    DEFAULT_CAMERA = [-305, 7, -11, 15, -30, 0, 0, 0, 1]
+
+    # Clicks closer together in time than this (seconds) at the same spot are
+    # treated as one click (the cortex and overlay meshes overlap exactly, so
+    # one click can be reported by both).
+    CLICK_DEBOUNCE = 0.3
+
+    def __init__(self, state, width = None, height = None):
         # Store the state.
         self.state = state
+        if height is None: height = self.state.view["height"]
+
+        # Handler for clicks on the mesh, set by the CortexViewer. It is called
+        # with the k3d click message (a dict with "position" and "face").
+        self.mesh_click_handler = None
+        self._last_click = (None, 0.0)
 
         # Create a figure background (k3d plot)
-        self.figure = k3d.plot(
+        plot_kwargs = dict(
             # K3d does not use width, just fills the space
-            height            = height, 
+            height            = height,
             grid_visible      = False,
             camera_auto_fit   = False,
             menu_visibility   = False,
-            camera_fov        = 60,
+            camera_fov        = self.CAMERA_FOV,
             axes_helper       = 0, # remove axes direction helper
             camera_zoom_speed = 1.5,
+            camera_mode       = self.state.view["camera_mode"],
         )
+        try:
+            self.figure = k3d.plot(**plot_kwargs)
+        except TypeError: # older k3d without camera_mode
+            plot_kwargs.pop("camera_mode")
+            self.figure = k3d.plot(**plot_kwargs)
 
         # Create and add the cortex mesh to the figure
         self.k3dmesh_cortex = self._init_cortex()
@@ -368,7 +486,14 @@ class CortexFigurePanel(ipw.GridBox):
         self.figure += self.k3dpoints_background 
 
         # Set initial camera values
-        self.figure.camera = [-160, -10, -6, 15, -30, 0, 0, 0, 1]
+        self.reset_camera()
+
+        # Listen for clicks on the cortex and overlay meshes. Clicks are only
+        # reported by k3d when the plot is in "callback" mode (see
+        # set_draw_mode), so this has no effect until drawing is turned on.
+        self.k3dmesh_cortex.click_callback  = self._on_k3d_click
+        self.k3dmesh_overlay.click_callback = self._on_k3d_click
+        self.set_draw_mode(self.state.view["draw_on_mesh"])
 
         # Define layout (GridBox as HBox)
         layout = ipw.Layout(
@@ -378,6 +503,86 @@ class CortexFigurePanel(ipw.GridBox):
         )
         super().__init__([ self.figure ], layout = layout)
         self.figure.camera_auto_fit = False
+
+    # View Methods -------------------------------------------------------------
+
+    def reset_camera(self):
+        """Move the camera back to the starting view."""
+        self.figure.camera = list(self.DEFAULT_CAMERA)
+        # Send even if the stored value did not change, so the browser always
+        # gets it.
+        self.figure.send_state("camera")
+
+
+    def set_camera_mode(self, mode):
+        """Set the k3d camera mode ("orbit" or "trackball")."""
+        if not hasattr(self.figure, "camera_mode"): return
+        if mode == self.figure.camera_mode: return
+
+        # When the mode changes, k3d (in the browser) re-fits the camera to
+        # the whole scene and reports the new camera back to Python. That
+        # moves the view. To keep the current view, wait for that report and
+        # then send the old camera again. (Sending it right away does not
+        # work: the browser's report arrives later and wins.)
+        camera = list(self.figure.camera)
+
+        def restore(change):
+            self._stop_watching_camera(restore)
+            if list(change.new) != camera:
+                self.figure.camera = camera
+
+        self.figure.observe(restore, names = "camera")
+        self.figure.camera_mode = mode
+        # Stop waiting if the report never comes (e.g. the view is hidden).
+        threading.Timer(2.0, self._stop_watching_camera, [restore]).start()
+
+
+    def _stop_watching_camera(self, handler):
+        """Remove a camera observer, if it is still registered."""
+        try:
+            self.figure.unobserve(handler, names = "camera")
+        except ValueError:
+            pass
+
+
+    def set_height(self, height):
+        """Set the height (in pixels) of the 3D panel."""
+        height = int(height)
+        # k3d uses `height` only when a plot is first drawn (new views).
+        self.figure.height = height
+        # Plots already on screen do not follow `height` (k3d 3.1), so resize
+        # them with a short script. k3d runs `additional_js_code` in every
+        # view of the plot when it changes.
+        self.figure.additional_js_code = (
+            "(function(){"
+            "var n = K3DInstance.getWorld().targetDOMNode.parentElement;"
+            f"n.style.height = '{height}px';"
+            "K3DInstance.resizeHelper();"
+            "})();"
+        )
+        self.layout.height = f"{height}px"
+
+
+    def set_draw_mode(self, draw):
+        """Turn drawing on the mesh on (k3d "callback" mode) or off ("view")."""
+        self.figure.mode = "callback" if draw else "view"
+
+    # Click Handling Methods ---------------------------------------------------
+
+    def _on_k3d_click(self, content):
+        """Receive a click on the mesh from k3d and pass it to the handler."""
+        if self.mesh_click_handler is None: return
+        if not isinstance(content, dict) or "position" not in content: return
+
+        # Ignore the second report of the same click (from the other mesh).
+        now = time.monotonic()
+        position = tuple(np.round(np.asarray(content["position"], float), 4))
+        last_position, last_time = self._last_click
+        if position == last_position and now - last_time < self.CLICK_DEBOUNCE:
+            return
+        self._last_click = (position, now)
+
+        self.mesh_click_handler(content)
 
 
     # k3d Color Helper Method --------------------------------------------------
@@ -694,18 +899,47 @@ class CortexFigurePanel(ipw.GridBox):
         """Refresh the cortex mesh."""
         # Update the cortex mesh values
         cortex_kwargs = self._prep_cortex()
+        moved = self._vertices_changed(self.k3dmesh_cortex, cortex_kwargs)
         for key in cortex_kwargs.keys():
             setattr(self.k3dmesh_cortex, key, cortex_kwargs[key])
+        if moved: self._rearm_clicks(self.k3dmesh_cortex)
         self.k3dmesh_cortex.visible = True
 
-        # Update the overlay mesh values 
+        # Update the overlay mesh values
         overlay_kwargs = self._prep_overlay()
         if self.state.style["overlay"] == "curvature":
             self.k3dmesh_overlay.visible = False
         else:
+            moved = self._vertices_changed(self.k3dmesh_overlay, overlay_kwargs)
             for key in overlay_kwargs.keys():
                 setattr(self.k3dmesh_overlay, key, overlay_kwargs[key])
+            if moved: self._rearm_clicks(self.k3dmesh_overlay)
             self.k3dmesh_overlay.visible = True
+
+
+    @staticmethod
+    def _vertices_changed(mesh, kwargs):
+        """Whether `kwargs` would move or replace the vertices of `mesh`."""
+        return (
+            not np.array_equal(mesh.vertices, kwargs["vertices"]) or
+            not np.array_equal(mesh.indices,  kwargs["indices"])
+        )
+
+
+    @staticmethod
+    def _rearm_clicks(mesh):
+        """Make k3d rebuild its click lookup after the mesh vertices change.
+
+        k3d finds the clicked triangle with a search tree that it builds once
+        and does not rebuild when the vertices are updated in place (e.g. when
+        the inflation changes). Clicks would then be tested against the old
+        shape, and most would be missed. Turning the click callback off and on
+        again makes k3d rebuild the tree from the current vertices.
+        """
+        callback = mesh.click_callback
+        if callback is None: return
+        mesh.click_callback = None
+        mesh.click_callback = callback
 
     
     def refresh_points(self):
