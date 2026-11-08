@@ -9,7 +9,9 @@ Implementation code for the Cortex Viewer.
 # Imports ----------------------------------------------------------------------
 
 import glob
+import colorsys
 import numpy as np
+import nibabel as nib
 import os.path as op
 import neuropythy as ny
 import ipywidgets as ipw
@@ -43,6 +45,15 @@ class CortexViewerState:
                     "kwargs": { "cmap": "temperature_dark", "vmin": -8, "vmax": 8 } }
             for key in ( "faces", "bodies", "places", "words" ) },
     }
+
+    # Folder with fsaverage sulcus labels (<hemi>.corticalsulc.mgz and
+    # corticalsulc.mgz.txt), relative to the dataset directory. Optional.
+    SULCI_SUBDIR = "sulci"
+
+    @staticmethod
+    def sulcus_color(k):
+        """Color for sulcus label k (the flatmap figure uses the same rule)."""
+        return colorsys.hsv_to_rgb((k * 0.618034) % 1.0, 0.75, 0.95)
 
     # Point type constants
     POINT_FIXED  = 2  # fixed head/tail
@@ -111,8 +122,10 @@ class CortexViewerState:
         fsa = ny.freesurfer_subject("fsaverage")
         
         # Return fsaverage dictionary values
+        sulci_dir = op.join(self.dataset_directory, CortexViewerState.SULCI_SUBDIR)
         out = {}
         for h in ( "lh", "rh" ):
+            sulci_file = op.join(sulci_dir, f"{h}.corticalsulc.mgz")
             hemi    = fsa.hemis[h]
             flatmap = hemi.mask_flatmap(**CortexViewerState.__FLATMAP_KWARGS)
             out[h]  = {
@@ -124,6 +137,11 @@ class CortexViewerState:
                 # the 3D mesh back to flatmap (figure) coordinates.
                 "flat_index"  : CortexViewerState._make_flat_index(
                     hemi.vertex_count, flatmap.labels),
+                # Sulcus label for each vertex (0 = none), or None if the
+                # label files are not available.
+                "sulci"       : (np.asarray(nib.load(sulci_file).dataobj)
+                                 .ravel().astype(int)
+                                 if op.isfile(sulci_file) else None),
             }
         return out
 
@@ -310,6 +328,14 @@ class CortexViewerState:
         """Update the cortical mesh color based on curvature."""
         if self.style["overlay"] == "curvature":
             self.overlay = None
+        elif self.style["overlay"] == "sulci":
+            # Curvature colors, with each labelled sulcus painted on top
+            labels = self.fsaverage[self.hemisphere]["sulci"]
+            colors = np.array(self.curvature, dtype = float)
+            if labels is not None:
+                for k in np.unique(labels[labels > 0]):
+                    colors[labels == k] = CortexViewerState.sulcus_color(k)
+            self.overlay = colors
         else: # Get property kwargs and values 
             overlay_style = self.style["overlay"]
             prop_kwargs   = CortexViewerState.__PROPERTY_KWARGS[overlay_style]

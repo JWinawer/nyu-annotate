@@ -241,6 +241,12 @@ class CortexControlPanel(ipw.VBox):
         return inflation_slider
 
 
+    def _sulci_available(self):
+        """Whether fsaverage sulcus labels were found for both hemispheres."""
+        fsa = getattr(self.state, "fsaverage", {})
+        return all(fsa.get(h, {}).get("sulci") is not None for h in ( "lh", "rh" ))
+
+
     def _init_overlay_dropdown(self):
         overlay_dropdown = ipw.Dropdown(
             options     = [
@@ -252,7 +258,7 @@ class CortexControlPanel(ipw.VBox):
                 ( "Bodies", "bodies" ),
                 ( "Places", "places" ),
                 ( "Words", "words" ),
-            ],
+            ] + ([ ( "Sulci", "sulci" ) ] if self._sulci_available() else []),
             value       = self.state.style["overlay"],    
             description = "Overlay:",
         )
