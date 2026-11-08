@@ -99,7 +99,11 @@ class CortexViewerState:
             "camera_mode"  : "orbit",   # "orbit" (fixed up axis) or "trackball"
             "height"       : 640,       # height of the 3D panel in pixels
             "draw_on_mesh" : False,     # whether clicks on the mesh add points
+            "click_mode"   : "points",  # "points" (add points) or "crosshair"
         }
+
+        # The crosshair (None, or a dict; see set_crosshair_*)
+        self.crosshair = None
 
         # Prepare participant 3d coordinate and mesh data
         self.update_participant()
@@ -408,6 +412,53 @@ class CortexViewerState:
         return flat_xy[:, col].copy()
 
 
+    # [Cortex Viewer] Crosshair -----------------------------------------------
+
+    def set_crosshair_from_flatmap(self, point):
+        """Place the crosshair at a flatmap (figure) point.
+
+        Returns `True` if the point is on the cortex, `False` if it is outside
+        the flatmap (then there is no crosshair on the mesh).
+        """
+        fsa_flatmap = self.fsaverage[self.hemisphere]["flatmap"]
+        point   = np.asarray(point, dtype = float).reshape(2, 1)
+        address = fsa_flatmap.address(point)
+        ok = np.all(np.isfinite(address["coordinates"])) and \
+             np.all(np.asarray(address["faces"]) >= 0)
+        self.crosshair = { "flatmap": point[:, 0],
+                           "address": address if ok else None,
+                           "vertex" : None }
+        return bool(ok)
+
+
+    def set_crosshair_from_surface(self, position, face = None):
+        """Place the crosshair at a clicked point on the mesh.
+
+        Returns the flatmap point, or `None` if the point is outside the
+        flatmap (the crosshair is then shown on the mesh only, at the
+        nearest vertex).
+        """
+        point = self.surface_to_flatmap(position, face)
+        if point is not None and self.set_crosshair_from_flatmap(point):
+            return point
+        coords = self.coordinates
+        position = np.asarray(position, dtype = float).reshape(3, 1)
+        vertex = int(np.argmin(np.sum((coords - position)**2, axis = 0)))
+        self.crosshair = { "flatmap": None, "address": None, "vertex": vertex }
+        return None
+
+
+    def crosshair_position(self):
+        """The crosshair's 3D position on the current mesh, or `None`."""
+        c = self.crosshair
+        if c is None: return None
+        if c["address"] is not None:
+            return self._flatmap_to_surface(c["address"], self.coordinates)[:, 0]
+        if c["vertex"] is not None:
+            return self.coordinates[:, c["vertex"]]
+        return None
+
+
     @staticmethod
     def _flatmap_to_surface(flatmap_address, mesh_coordinates):
         """Convert flatmap annotation coordinates to surface coordinates."""
@@ -668,9 +719,15 @@ class CortexViewer(ipw.GridBox):
         self.control_panel.reset_button.on_click(
             lambda _: self.figure_panel.reset_camera())
         self.control_panel.delete_button.on_click(self.on_delete_point)
+        self.control_panel.observe_click_mode_toggle(self.on_click_mode_change)
+        self.control_panel.clear_crosshair_button.on_click(
+            lambda _: self.clear_crosshair())
 
-        # Clicks on the mesh add points to the active annotation
+        # Clicks on the mesh add points to the active annotation (or place the
+        # crosshair), and crosshair clicks on any flatmap are passed here.
         self.figure_panel.mesh_click_handler = self.on_mesh_click
+        for flat_panel in self._all_figure_panels():
+            flat_panel.crosshair_handler = self.on_flatmap_crosshair
 
     # [Cortex Viewer] View and Drawing Handlers --------------------------------
 
@@ -689,7 +746,57 @@ class CortexViewer(ipw.GridBox):
     def on_draw_toggle(self, change):
         """Turn drawing on the mesh on or off."""
         self.state.view["draw_on_mesh"] = bool(change.new)
-        self.figure_panel.set_draw_mode(bool(change.new))
+        self._update_mesh_clicks()
+
+
+    def _update_mesh_clicks(self):
+        """Listen for mesh clicks when drawing on the mesh or in crosshair mode."""
+        view = self.state.view
+        self.figure_panel.set_draw_mode(
+            view["draw_on_mesh"] or view["click_mode"] == "crosshair")
+
+    # [Cortex Viewer] Crosshair Handlers ---------------------------------------
+
+    def _all_figure_panels(self):
+        """The flatmap figure panels of all datasets."""
+        return [ tool.figure_panel
+                 for tool in self.state.annotation_widgets.children ]
+
+
+    def on_click_mode_change(self, change):
+        """Switch between adding points and placing a crosshair."""
+        self.state.view["click_mode"] = change.new
+        crosshair = (change.new == "crosshair")
+        for flat_panel in self._all_figure_panels():
+            flat_panel.crosshair_mode = crosshair
+        self._update_mesh_clicks()
+
+
+    def clear_crosshair(self):
+        """Remove the crosshair from all maps and the mesh."""
+        self.state.crosshair = None
+        for flat_panel in self._all_figure_panels():
+            if flat_panel.crosshair is not None:
+                flat_panel.set_crosshair(None)
+        self.figure_panel.refresh_crosshair()
+
+
+    def on_flatmap_crosshair(self, point):
+        """A crosshair was placed on a flatmap: show the same spot on the mesh."""
+        self.state.set_crosshair_from_flatmap(point)
+        self.figure_panel.refresh_crosshair()
+
+
+    def _place_crosshair_from_mesh(self, content):
+        """A crosshair click on the mesh: show the spot on the flatmaps too."""
+        flat_panel = self.state._get_active_figure_panel()
+        point = self.state.set_crosshair_from_surface(
+            content.get("position"), content.get("face"))
+        flat_panel.set_crosshair(point)
+        if point is None:
+            self._flash_message(flat_panel,
+                "That spot is outside the flatmap region.")
+        self.figure_panel.refresh_crosshair()
 
 
     def _flash_message(self, figure_panel, message, seconds = 2.5):
@@ -709,12 +816,18 @@ class CortexViewer(ipw.GridBox):
     def on_mesh_click(self, content):
         """Add a point to the active annotation where the mesh was clicked.
 
+        In crosshair mode, the click places the crosshair instead.
+
         The clicked 3D point is converted to flatmap coordinates, and then
         added with the flatmap tool's own `push_point`, so it behaves exactly
         like a click on the flatmap (cursor, fixed points, dependencies, and
         saving all work the same way). The 3D view then updates through the
         usual annotation-change observer.
         """
+        if self.state.view["click_mode"] == "crosshair":
+            self._place_crosshair_from_mesh(content)
+            return
+
         figure_panel = self.state._get_active_figure_panel()
         if figure_panel.state.locked: return
         if self.state.active is None:
@@ -778,6 +891,13 @@ class CortexViewer(ipw.GridBox):
         if key == "dataset":
             self.state.update_annot_cfg()
             self.state.update_styler()
+
+        # A crosshair belongs to one participant and hemisphere.
+        if key in ( "dataset", "targets" ):
+            self.state.crosshair = None
+            for flat_panel in self._all_figure_panels():
+                if flat_panel.crosshair is not None:
+                    flat_panel.set_crosshair(None)
 
         # Update the cortex viewer state based on selection change
         if key in ( "dataset", "targets" ):

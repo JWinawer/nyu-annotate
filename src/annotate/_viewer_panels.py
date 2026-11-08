@@ -74,7 +74,9 @@ class CortexControlPanel(ipw.VBox):
         self.height_slider    = self._init_height_slider()
         self.reset_button     = self._init_button("Reset view", "Return the camera to the starting view.")
 
-        # Create the drawing widgets (draw on mesh toggle, delete point button)
+        # Create the click widgets (click mode, draw on mesh toggle, buttons)
+        self.click_mode_toggle = self._init_click_mode_toggle()
+        self.clear_crosshair_button = self._init_button("Clear crosshair", "Remove the crosshair from all maps and the mesh.")
         self.draw_checkbox    = self._init_draw_checkbox()
         self.delete_button    = self._init_button("Delete point", "Delete the point at the cursor of the active annotation (same as Backspace on the flatmap).")
 
@@ -118,12 +120,16 @@ class CortexControlPanel(ipw.VBox):
             self.reset_button,
             # Horizontal line
             self._make_hline(),
-            # Drawing Options title
-            self._make_section_title("Draw:"),
+            # Click Options title
+            self._make_section_title("Clicks:"),
+            # Click mode (add points or crosshair)
+            self.click_mode_toggle,
             # Draw on mesh checkbox
             self.draw_checkbox,
             # Delete point button
             self.delete_button,
+            # Clear crosshair button
+            self.clear_crosshair_button,
         ]
         vbox = ipw.VBox(children, layout = { "width": "250px" })
 
@@ -345,6 +351,19 @@ class CortexControlPanel(ipw.VBox):
         return height_slider
 
 
+    def _init_click_mode_toggle(self):
+        click_mode_toggle = ipw.ToggleButtons(
+            options  = [ ( "Add points", "points" ), ( "Crosshair", "crosshair" ) ],
+            value    = self.state.view["click_mode"],
+            tooltips = [ "Clicks add points to the active annotation.",
+                         "Clicks on any map or on the mesh place a crosshair "
+                         "at that spot in all maps and on the mesh." ],
+            style    = { "button_width": "100px" },
+        )
+        click_mode_toggle.add_class("cortex-control-widgets")
+        return click_mode_toggle
+
+
     def _init_draw_checkbox(self):
         draw_checkbox = ipw.Checkbox(
             value       = self.state.view["draw_on_mesh"],
@@ -411,6 +430,11 @@ class CortexControlPanel(ipw.VBox):
     def observe_height_slider(self, callback):
         """A method to register a callback for changes in the panel height."""
         self.height_slider.observe(callback, names = "value")
+
+
+    def observe_click_mode_toggle(self, callback):
+        """A method to register a callback for changes in the click mode."""
+        self.click_mode_toggle.observe(callback, names = "value")
 
 
     def observe_draw_checkbox(self, callback):
@@ -483,6 +507,9 @@ class CortexFigurePanel(ipw.GridBox):
         self.k3dline_background, self.k3dpoints_background = \
             self._init_background_annotations()
 
+        # Create the crosshair marker (one sphere, hidden until placed)
+        self.k3dpoints_crosshair = self._init_points()
+
         # Add the meshes and points to the figure and initial render
         self.figure += self.k3dmesh_cortex
         self.figure += self.k3dmesh_overlay 
@@ -490,6 +517,7 @@ class CortexFigurePanel(ipw.GridBox):
         self.figure += self.k3dpoints_active 
         self.figure += self.k3dline_background
         self.figure += self.k3dpoints_background 
+        self.figure += self.k3dpoints_crosshair
 
         # Set initial camera values
         self.reset_camera()
@@ -499,7 +527,8 @@ class CortexFigurePanel(ipw.GridBox):
         # set_draw_mode), so this has no effect until drawing is turned on.
         self.k3dmesh_cortex.click_callback  = self._on_k3d_click
         self.k3dmesh_overlay.click_callback = self._on_k3d_click
-        self.set_draw_mode(self.state.view["draw_on_mesh"])
+        self.set_draw_mode(self.state.view["draw_on_mesh"] or
+                           self.state.view["click_mode"] == "crosshair")
 
         # Define layout (GridBox as HBox)
         layout = ipw.Layout(
@@ -898,6 +927,7 @@ class CortexFigurePanel(ipw.GridBox):
         self.k3dpoints_active.visible     = False
         self.k3dline_background.visible   = False
         self.k3dpoints_background.visible = False 
+        self.k3dpoints_crosshair.visible  = False
 
     # Figure Refresh Methods ---------------------------------------------------
 
@@ -987,6 +1017,23 @@ class CortexFigurePanel(ipw.GridBox):
             self.k3dpoints_background.visible = True
             
 
+    # Crosshair color (k3d color) and size (relative to the point size)
+    CROSSHAIR_COLOR = 0xffeb3b
+    CROSSHAIR_SCALE = 4
+
+    def refresh_crosshair(self):
+        """Show the crosshair marker on the mesh (or hide it if there is none)."""
+        position = self.state.crosshair_position()
+        if position is None:
+            self.k3dpoints_crosshair.visible = False
+            return
+        size = float(self.state.style["point_size"]) * self.CROSSHAIR_SCALE
+        self.k3dpoints_crosshair.positions   = np.asarray(position, np.float32).reshape(1, 3)
+        self.k3dpoints_crosshair.point_sizes = np.array([size], np.float32)
+        self.k3dpoints_crosshair.colors      = np.array([self.CROSSHAIR_COLOR], np.uint32)
+        self.k3dpoints_crosshair.visible     = True
+
+
     def refresh_figure(self, clear = False, cortex = True, points = True):
         """Refresh the entire figure."""
         # Disable auto rendering for performance
@@ -999,6 +1046,7 @@ class CortexFigurePanel(ipw.GridBox):
             self.refresh_cortex()
         if points:
             self.refresh_points()
+            self.refresh_crosshair()
         
         # Re-enable auto rendering after cortex and overlay values
         self.figure.auto_rendering = True

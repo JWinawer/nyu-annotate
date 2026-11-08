@@ -85,7 +85,7 @@ class FigurePanel(ipw.HBox):
         # Make a multicanvas.
         canvas_width, canvas_height = self.canvas_size
         self.multicanvas = ipc.MultiCanvas(
-            5, width = canvas_width, height = canvas_height)
+            6, width = canvas_width, height = canvas_height)
 
         # We always seem to need to explicitly set the layout size in pixels.
         self.multicanvas.layout.width  = f"{canvas_width}px"
@@ -95,8 +95,9 @@ class FigurePanel(ipw.HBox):
         self.image_canvas      = self.multicanvas[0] # grid image layer
         self.background_canvas = self.multicanvas[1] # background annotation layer 
         self.active_canvas     = self.multicanvas[2] # active annotation layer
-        self.loading_canvas    = self.multicanvas[3] # loading screen layer
-        self.message_canvas    = self.multicanvas[4] # message layer (for errors, etc.)
+        self.crosshair_canvas  = self.multicanvas[3] # crosshair layer
+        self.loading_canvas    = self.multicanvas[4] # loading screen layer
+        self.message_canvas    = self.multicanvas[5] # message layer (for errors, etc.)
 
         # Draw the loading screen on the loading canvas and save it as the loading context.
         self._draw_loading(self.loading_canvas)
@@ -124,6 +125,15 @@ class FigurePanel(ipw.HBox):
         self.fixed_tails = {}
         self.editable    = np.array([])
         self.cursor      = None
+
+        # Initialize the crosshair variables. In crosshair mode, a click places
+        # a crosshair (drawn at the same spot in every map of the grid) instead
+        # of adding a point. `crosshair_handler`, if set, is called with the
+        # crosshair's figure coordinates after each click (the 3D viewer uses
+        # it to show the same spot on the mesh).
+        self.crosshair_mode    = False
+        self.crosshair         = None
+        self.crosshair_handler = None
 
         # Initialize our parent class.
         super().__init__(
@@ -319,6 +329,38 @@ class FigurePanel(ipw.HBox):
                 color  = [rgb_color],
             )
 
+    # Crosshair Methods --------------------------------------------------------
+
+    # Crosshair look, in canvas pixels: the gap at the center and the length
+    # of each of the four arms.
+    CROSSHAIR_GAP = 4
+    CROSSHAIR_ARM = 14
+
+    def set_crosshair(self, point):
+        """Place the crosshair at the given figure point (or remove it if `None`)."""
+        self.crosshair = None if point is None else \
+            np.asarray(point, dtype = float).reshape(2)
+        self.redraw_crosshair()
+
+
+    def redraw_crosshair(self):
+        """Clears the crosshair canvas and draws the crosshair in every map."""
+        canvas = self.crosshair_canvas
+        with ipc.hold_canvas():
+            canvas.clear()
+            if self.crosshair is None or self.grid is None: return
+            (gap, arm) = (self.CROSSHAIR_GAP, self.CROSSHAIR_GAP + self.CROSSHAIR_ARM)
+            canvas.set_line_dash([])
+            for (x, y) in (p[0] for p in self.figure_to_canvas(self.crosshair[None, :])):
+                arms = [ (x - arm, y, x - gap, y), (x + gap, y, x + arm, y),
+                         (x, y - arm, x, y - gap), (x, y + gap, x, y + arm) ]
+                # A dark outline under a bright line, so it shows on any map.
+                for (color, width) in (( "black", 4 ), ( "#ffeb3b", 2 )):
+                    canvas.stroke_style = color
+                    canvas.line_width   = width
+                    for (x0, y0, x1, y1) in arms:
+                        canvas.stroke_line(x0, y0, x1, y1)
+
     # Loading Canvas Methods ---------------------------------------------------
 
     @staticmethod
@@ -452,6 +494,9 @@ class FigurePanel(ipw.HBox):
         # If neither the target nor the annotation is changing, we can skip the update.
         if self.target == target_id and self.template == annotation and \
             self.active == active: return
+
+        # A crosshair belongs to one target (participant and hemisphere).
+        if self.target != target_id: self.crosshair = None
 
         # Store the previous state.
         prev_target     = self.target
@@ -631,6 +676,7 @@ class FigurePanel(ipw.HBox):
             if redraw_annotations: 
                 self.redraw_annotations()
                 self._increment_annotation_change()
+            self.redraw_crosshair()
 
     # Canvas to Figure Coordinate Conversion Method ----------------------------
 
@@ -834,6 +880,14 @@ class FigurePanel(ipw.HBox):
         """This method is called when the mouse is clicked on the canvas."""        
         # If the figure is locked, we do not allow events. Skip.
         if self.state.locked: return
+
+        # In crosshair mode, place the crosshair instead of adding a point.
+        if self.crosshair_mode:
+            point = self.canvas_to_figure([x, y])
+            self.set_crosshair(point)
+            if self.crosshair_handler is not None:
+                self.crosshair_handler(point)
+            return
 
         # Add to the current contour.
         self._push_impoint(x, y)
