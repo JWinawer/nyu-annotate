@@ -82,7 +82,10 @@ RUN mamba update -y -n base mamba
 RUN mamba update --all -y 
 RUN ln -s /opt/conda/lib/libstdc++.so.6.0.34 /opt/conda/lib/libstdc++.so.6 || true
 #RUN mamba install -y -cconda-forge nibabel s3fs
+# Keep NumPy below 2: `mamba update --all` now brings NumPy 2, but the base
+# image's dask (needed by neuropythy, through pint) does not work with it.
 RUN mamba install -y -cconda-forge \
+      'numpy<2' \
       'blas=*=openblas' \
       'libblas=*=*openblas' \
       ipywidgets \
