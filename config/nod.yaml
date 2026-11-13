@@ -27,6 +27,30 @@ init: |
   from struct import unpack
   from matplotlib.colors import LinearSegmentedColormap
 
+  # Cortical sulcus labels, drawn on fsaverage (NSD data, Kendrick Kay). They come
+  # from the NSD bucket (nsddata/freesurfer/fsaverage/label). All subjects here
+  # are stored on fsaverage vertices, so the same labels apply to everyone.
+  # They are atlas labels: small sulci (ptCoS, mFus, OTS) can miss a subject's
+  # own folds, so check them against the curvature.
+  import colorsys
+  import nibabel as nib
+  SULCI_DIR   = op.join("/home", "jovyan", "datasets", "sulci")
+  SULCI       = {} # hemisphere -> label per fsaverage vertex (0 = none)
+  SULCI_NAMES = {} # label number -> short name
+  if op.isdir(SULCI_DIR):
+    for h in ( "lh", "rh" ):
+      fname    = op.join(SULCI_DIR, f"{h}.corticalsulc.mgz")
+      SULCI[h] = np.asarray(nib.load(fname).dataobj).ravel().astype(int)
+    with open(op.join(SULCI_DIR, "corticalsulc.mgz.txt")) as f:
+      for line in f:
+        parts = line.split()
+        if len(parts) >= 2:
+          SULCI_NAMES[int(parts[0])] = parts[1]
+
+  def sulcus_color(k):
+    """Color for sulcus label k (the 3D viewer uses the same rule)."""
+    return colorsys.hsv_to_rgb((k * 0.618034) % 1.0, 0.75, 0.95)
+
   # Define directories
   dataset  = "nod"
   data_dir = op.join("/home", "jovyan", "datasets", dataset)
@@ -106,6 +130,10 @@ targets:
     # copy fsaverage flatmap 
     participant_flatmap = fsa_flatmaps[fs_hemi].copy()
 
+    # attach sulcus labels (fsaverage atlas), if available
+    if fs_hemi in SULCI:
+      props["sulci"] = SULCI[fs_hemi][participant_flatmap.labels]
+
     # attatch and return properties to fsaverage flatmap
     return participant_flatmap.with_prop(props)
 
@@ -117,28 +145,28 @@ annotations:
     variable: true
     variable_options: [ "IOG-faces", "pFus-faces", "mFus-faces" ]
     figure_grid: 
-     - [ "faces", "curvature" ]
+     - [ "faces", "sulci" ]
   # Body Areas (variable)
   Body Areas:
     type: boundary
     variable: true
     variable_options: [ "ITG-bodies", "LOS-bodies" ]
     figure_grid: 
-     - [ "bodies", "curvature" ]
+     - [ "bodies", "sulci" ]
   # Place Areas (variable)
   Place Areas:
     type: boundary
     variable: true
     variable_options: [ "CoS-places" ]
     figure_grid: 
-     - [ "places", "curvature" ]
+     - [ "places", "sulci" ]
   # Word Areas (variable)
   Word Areas:
     type: boundary
     variable: true
     variable_options: [ "VWFA-1", "VWFA-2" ]
     figure_grid: 
-     - [ "words", "curvature" ]
+     - [ "words", "sulci" ]
 
 
 figures:
@@ -153,6 +181,28 @@ figures:
     )
   curvature: |
     ny.cortex_plot(mesh = target["flatmap"], axes = axes)
+  sulci: |
+    # curvature with sulcus label outlines and names on top
+    import matplotlib.patheffects as pe
+    fm = target["flatmap"]
+    ny.cortex_plot(mesh = fm, axes = axes)
+    if "sulci" in fm.properties:
+      labels = np.asarray(fm.prop("sulci")).astype(int)
+      (x, y) = fm.coordinates
+      faces  = fm.tess.indexed_faces.T
+      for k in np.unique(labels[labels > 0]):
+        inside = (labels == k)
+        if inside.sum() < 20: continue # skip tiny slivers at the map edge
+        color = sulcus_color(k)
+        axes.tricontour(x, y, faces, inside.astype(float), levels = [0.5],
+                        colors = [color], linewidths = 0.8)
+        # put the name on the labelled vertex nearest the label's median
+        (mx, my) = (np.median(x[inside]), np.median(y[inside]))
+        ii = np.flatnonzero(inside)
+        jj = ii[np.argmin((x[ii] - mx)**2 + (y[ii] - my)**2)]
+        axes.text(x[jj], y[jj], SULCI_NAMES.get(k, str(k)), color = color,
+                  fontsize = 5, ha = "center", va = "center",
+                  path_effects = [pe.withStroke(linewidth = 1.5, foreground = "k")])
   term: |
     # figure aesthetics and limits
     xy = target["flatmap"].coordinates
